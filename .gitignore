@@ -1,0 +1,11 @@
+# Real system logs
+logs/real-auth.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
