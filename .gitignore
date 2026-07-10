@@ -1,11 +1,21 @@
 # Real system logs
 logs/real-auth.log
 
+# Generated alert output
+alerts/alerts.csv
+
 # Python cache
 __pycache__/
 *.pyc
+
+# Environment and secrets
+.env
+*.key
+*.pem
 
 # OS/editor files
 .DS_Store
 .vscode/
 .idea/
+*.swp
+*.tmp
