@@ -19,3 +19,7 @@ __pycache__/
 .idea/
 *.swp
 *.tmp
+
+# Local SSH key files
+leo
+leo.pub
