@@ -3,12 +3,13 @@ import unittest
 
 from src.main import (
     BRUTE_FORCE_THRESHOLD,
+    build_incident_record,
     classify_activity,
     count_events,
     create_incident_windows,
+    get_incident_time_range,
     parse_log_timestamp,
 )
-
 
 class TestTimestampParsing(unittest.TestCase):
     def test_valid_ubuntu_timestamp(self):
@@ -137,6 +138,62 @@ class TestClassification(unittest.TestCase):
         )
         self.assertEqual(mitre, "T1110, T1078")
 
+class TestIncidentJsonModel(unittest.TestCase):
+    def test_incident_time_range(self):
+        logs = [
+            "Apr 28 14:02:00 ubuntu sshd[2]: Failed password",
+            "Apr 28 14:00:00 ubuntu sshd[1]: Failed password",
+        ]
+
+        start_time, end_time = get_incident_time_range(logs)
+
+        self.assertEqual(start_time, "2026-04-28T14:00:00")
+        self.assertEqual(end_time, "2026-04-28T14:02:00")
+
+    def test_invalid_timestamps_return_null_range(self):
+        logs = [
+            "INVALID-TIME ubuntu sshd[1]: Failed password",
+        ]
+
+        start_time, end_time = get_incident_time_range(logs)
+
+        self.assertIsNone(start_time)
+        self.assertIsNone(end_time)
+
+    def test_build_incident_record(self):
+        logs = [
+            "Apr 28 10:00:00 ubuntu sshd[1]: Failed password",
+            "Apr 28 10:01:00 ubuntu sshd[2]: Accepted password",
+        ]
+
+        incident = build_incident_record(
+            alert_id=1,
+            generated_at="2026-07-11 14:30:00",
+            ip="192.168.1.50",
+            is_ioc_match=True,
+            failed=1,
+            successful=1,
+            severity="CRITICAL",
+            classification="Brute Force → Successful Login",
+            mitre="T1110, T1078",
+            logs=logs,
+        )
+
+        self.assertEqual(incident["incident_id"], "INC-0001")
+        self.assertEqual(incident["source_ip"], "192.168.1.50")
+        self.assertTrue(incident["ioc"]["matched"])
+        self.assertEqual(
+            incident["event_counts"]["total_events"],
+            2,
+        )
+        self.assertEqual(
+            incident["mitre_attack"],
+            ["T1110", "T1078"],
+        )
+        self.assertEqual(
+            incident["severity"],
+            "CRITICAL",
+        )
 
 if __name__ == "__main__":
     unittest.main()
