@@ -6,16 +6,20 @@ from src.main import (
     build_incident_record,
     classify_activity,
     count_events,
+    create_incident_fingerprint,
     create_incident_windows,
     get_incident_time_range,
+    is_duplicate_incident,
     parse_log_timestamp,
 )
+
 
 class TestTimestampParsing(unittest.TestCase):
     def test_valid_ubuntu_timestamp(self):
         log = (
             "Apr 28 10:35:11 ubuntu sshd[1234]: "
-            "Failed password for root from 192.168.56.101 port 44322 ssh2"
+            "Failed password for root from "
+            "192.168.56.101 port 44322 ssh2"
         )
 
         result = parse_log_timestamp(log)
@@ -30,7 +34,8 @@ class TestTimestampParsing(unittest.TestCase):
     def test_invalid_timestamp_returns_none(self):
         log = (
             "INVALID-TIME ubuntu sshd[5001]: "
-            "Failed password for root from 10.10.10.80 port 43001 ssh2"
+            "Failed password for root from "
+            "10.10.10.80 port 43001 ssh2"
         )
 
         result = parse_log_timestamp(log)
@@ -53,8 +58,10 @@ class TestEventCounting(unittest.TestCase):
 
     def test_repeated_message_count(self):
         logs = [
-            "Apr 28 10:00:00 ubuntu sshd[1]: "
-            "Failed password message repeated 4 times"
+            (
+                "Apr 28 10:00:00 ubuntu sshd[1]: "
+                "Failed password message repeated 4 times"
+            )
         ]
 
         failed, successful = count_events(logs)
@@ -138,6 +145,7 @@ class TestClassification(unittest.TestCase):
         )
         self.assertEqual(mitre, "T1110, T1078")
 
+
 class TestIncidentJsonModel(unittest.TestCase):
     def test_incident_time_range(self):
         logs = [
@@ -146,9 +154,16 @@ class TestIncidentJsonModel(unittest.TestCase):
         ]
 
         start_time, end_time = get_incident_time_range(logs)
+        current_year = datetime.datetime.now().year
 
-        self.assertEqual(start_time, "2026-04-28T14:00:00")
-        self.assertEqual(end_time, "2026-04-28T14:02:00")
+        self.assertEqual(
+            start_time,
+            f"{current_year}-04-28T14:00:00",
+        )
+        self.assertEqual(
+            end_time,
+            f"{current_year}-04-28T14:02:00",
+        )
 
     def test_invalid_timestamps_return_null_range(self):
         logs = [
@@ -180,7 +195,10 @@ class TestIncidentJsonModel(unittest.TestCase):
         )
 
         self.assertEqual(incident["incident_id"], "INC-0001")
-        self.assertEqual(incident["source_ip"], "192.168.1.50")
+        self.assertEqual(
+            incident["source_ip"],
+            "192.168.1.50",
+        )
         self.assertTrue(incident["ioc"]["matched"])
         self.assertEqual(
             incident["event_counts"]["total_events"],
@@ -194,6 +212,136 @@ class TestIncidentJsonModel(unittest.TestCase):
             incident["severity"],
             "CRITICAL",
         )
+
+
+class TestDeduplication(unittest.TestCase):
+    def test_fingerprint_is_stable(self):
+        incident = {
+            "source_ip": "192.168.1.50",
+            "classification": "SSH Brute Force",
+            "time_window": {
+                "start": "2026-04-28T10:00:00",
+                "end": "2026-04-28T10:02:00",
+                "window_minutes": 5,
+            },
+            "evidence": [
+                "Apr 28 10:00:00 Failed password",
+                "Apr 28 10:02:00 Failed password",
+            ],
+        }
+
+        first = create_incident_fingerprint(incident)
+        second = create_incident_fingerprint(incident)
+
+        self.assertEqual(first, second)
+
+    def test_first_incident_is_not_duplicate(self):
+        state = {}
+
+        current_time = datetime.datetime(
+            2026,
+            7,
+            11,
+            15,
+            0,
+            0,
+        )
+
+        result = is_duplicate_incident(
+            "fingerprint-1",
+            state,
+            current_time,
+        )
+
+        self.assertFalse(result)
+        self.assertIn("fingerprint-1", state)
+        self.assertEqual(
+            state["fingerprint-1"]["repeat_count"],
+            1,
+        )
+
+    def test_repeated_incident_inside_cooldown_is_duplicate(self):
+        state = {}
+
+        first_time = datetime.datetime(
+            2026,
+            7,
+            11,
+            15,
+            0,
+            0,
+        )
+
+        second_time = datetime.datetime(
+            2026,
+            7,
+            11,
+            15,
+            10,
+            0,
+        )
+
+        is_duplicate_incident(
+            "fingerprint-1",
+            state,
+            first_time,
+        )
+
+        result = is_duplicate_incident(
+            "fingerprint-1",
+            state,
+            second_time,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            state["fingerprint-1"]["repeat_count"],
+            2,
+        )
+
+    def test_incident_after_cooldown_is_not_duplicate(self):
+        state = {}
+
+        first_time = datetime.datetime(
+            2026,
+            7,
+            11,
+            15,
+            0,
+            0,
+        )
+
+        later_time = datetime.datetime(
+            2026,
+            7,
+            11,
+            15,
+            31,
+            0,
+        )
+
+        is_duplicate_incident(
+            "fingerprint-1",
+            state,
+            first_time,
+        )
+
+        result = is_duplicate_incident(
+            "fingerprint-1",
+            state,
+            later_time,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            state["fingerprint-1"]["repeat_count"],
+            2,
+        )
+        self.assertEqual(
+            state["fingerprint-1"]["last_seen"],
+            later_time.isoformat(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
