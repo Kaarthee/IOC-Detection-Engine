@@ -20,6 +20,7 @@ ALERT_FILE = Path("alerts/alerts.csv")
 FEED_SOURCE = "Local IOC JSON"
 MAX_LOG_DISPLAY = 5
 BRUTE_FORCE_THRESHOLD = 5
+CORRELATION_WINDOW_MINUTES = 5
 
 
 def load_iocs(ioc_file: Path) -> set[str]:
@@ -47,7 +48,11 @@ def load_iocs(ioc_file: Path) -> set[str]:
 def read_logs(log_file: Path) -> list[str]:
     """Read authentication log lines."""
     try:
-        with log_file.open("r", encoding="utf-8", errors="replace") as file:
+        with log_file.open(
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as file:
             return file.readlines()
 
     except FileNotFoundError:
@@ -65,13 +70,89 @@ def extract_ip_logs(log_lines: list[str]) -> dict[str, list[str]]:
     grouped_logs: dict[str, list[str]] = defaultdict(list)
 
     for line in log_lines:
-        if "Failed password" not in line and "Accepted password" not in line:
+        if (
+            "Failed password" not in line
+            and "Accepted password" not in line
+        ):
             continue
 
         for ip in ip_pattern.findall(line):
             grouped_logs[ip].append(line.strip())
 
     return grouped_logs
+
+
+def parse_log_timestamp(log: str) -> datetime.datetime | None:
+    """Parse a standard Ubuntu syslog timestamp."""
+    timestamp_pattern = re.compile(
+        r"^(?P<month>[A-Z][a-z]{2})\s+"
+        r"(?P<day>\d{1,2})\s+"
+        r"(?P<time>\d{2}:\d{2}:\d{2})"
+    )
+
+    match = timestamp_pattern.search(log)
+
+    if not match:
+        return None
+
+    timestamp_text = (
+        f"{datetime.datetime.now().year} "
+        f"{match.group('month')} "
+        f"{match.group('day')} "
+        f"{match.group('time')}"
+    )
+
+    try:
+        return datetime.datetime.strptime(
+            timestamp_text,
+            "%Y %b %d %H:%M:%S",
+        )
+    except ValueError:
+        return None
+
+
+def create_incident_windows(
+    logs: list[str],
+) -> list[list[str]]:
+    """Group log entries into incidents using a fixed time window."""
+    parsed_logs: list[tuple[datetime.datetime, str]] = []
+
+    for log in logs:
+        timestamp = parse_log_timestamp(log)
+
+        if timestamp is not None:
+            parsed_logs.append((timestamp, log))
+
+    if not parsed_logs:
+        return [logs] if logs else []
+
+    parsed_logs.sort(key=lambda item: item[0])
+
+    incidents: list[list[str]] = []
+    current_incident: list[str] = []
+    window_start: datetime.datetime | None = None
+
+    for timestamp, log in parsed_logs:
+        if window_start is None:
+            window_start = timestamp
+            current_incident = [log]
+            continue
+
+        time_difference = timestamp - window_start
+
+        if time_difference <= datetime.timedelta(
+            minutes=CORRELATION_WINDOW_MINUTES
+        ):
+            current_incident.append(log)
+        else:
+            incidents.append(current_incident)
+            current_incident = [log]
+            window_start = timestamp
+
+    if current_incident:
+        incidents.append(current_incident)
+
+    return incidents
 
 
 def count_events(logs: list[str]) -> tuple[int, int]:
@@ -101,9 +182,9 @@ def classify_activity(
     is_ioc_match: bool,
 ) -> tuple[str, str, str, str]:
     """
-    Return severity, classification, MITRE ATT&CK mapping and display colour.
+    Return severity, classification, MITRE ATT&CK mapping
+    and display colour.
     """
-
     if failed > 0 and successful > 0:
         severity = "CRITICAL"
         classification = "Brute Force → Successful Login"
@@ -166,7 +247,11 @@ def write_csv_header(alert_file: Path) -> None:
     """Create the alert CSV file and write its header."""
     alert_file.parent.mkdir(parents=True, exist_ok=True)
 
-    with alert_file.open("w", newline="", encoding="utf-8") as csvfile:
+    with alert_file.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as csvfile:
         writer = csv.writer(csvfile)
 
         writer.writerow(
@@ -200,7 +285,11 @@ def append_alert(
     logs: list[str],
 ) -> None:
     """Append a structured alert to the CSV file."""
-    with alert_file.open("a", newline="", encoding="utf-8") as csvfile:
+    with alert_file.open(
+        "a",
+        newline="",
+        encoding="utf-8",
+    ) as csvfile:
         writer = csv.writer(csvfile)
 
         writer.writerow(
@@ -252,14 +341,20 @@ def print_alert(
     print(f"{CYAN}Classification:{RESET} {classification}")
     print(f"{CYAN}MITRE ATT&CK:{RESET} {mitre}")
 
-    print(f"\n{CYAN}Evidence — last {MAX_LOG_DISPLAY} entries:{RESET}")
+    print(
+        f"\n{CYAN}Evidence — last "
+        f"{MAX_LOG_DISPLAY} entries:{RESET}"
+    )
 
     for log in logs[-MAX_LOG_DISPLAY:]:
         print(f"  - {log}")
 
     if len(logs) > MAX_LOG_DISPLAY:
         hidden_count = len(logs) - MAX_LOG_DISPLAY
-        print(f"{CYAN}... ({hidden_count} more logs hidden){RESET}")
+        print(
+            f"{CYAN}... "
+            f"({hidden_count} more logs hidden){RESET}"
+        )
 
     print(f"{colour}{'=' * 60}{RESET}\n")
 
@@ -269,7 +364,11 @@ def main() -> None:
     log_lines = read_logs(LOG_FILE)
     ip_logs = extract_ip_logs(log_lines)
 
-    print(f"{CYAN}========== IOC Detection Engine v2 =========={RESET}\n")
+    print(
+        f"{CYAN}========== "
+        f"IOC Detection Engine v2 "
+        f"=========={RESET}\n"
+    )
     print(f"Log source: {LOG_FILE}")
     print(f"IOC source: {IOC_FILE}")
     print(f"Observed IPs: {len(ip_logs)}\n")
@@ -279,53 +378,74 @@ def main() -> None:
     alert_id = 1
 
     for ip, logs in ip_logs.items():
-        failed, successful = count_events(logs)
         is_ioc_match = ip in malicious_ips
+        incident_windows = create_incident_windows(logs)
 
-        if not should_alert(failed, successful, is_ioc_match):
-            continue
+        for incident_number, incident_logs in enumerate(
+            incident_windows,
+            start=1,
+        ):
+            failed, successful = count_events(incident_logs)
 
-        severity, classification, mitre, colour = classify_activity(
-            failed,
-            successful,
-            is_ioc_match,
-        )
+            if not should_alert(
+                failed,
+                successful,
+                is_ioc_match,
+            ):
+                continue
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            severity, classification, mitre, colour = classify_activity(
+                failed,
+                successful,
+                is_ioc_match,
+            )
 
-        print_alert(
-            alert_id,
-            ip,
-            is_ioc_match,
-            failed,
-            successful,
-            severity,
-            classification,
-            mitre,
-            colour,
-            logs,
-        )
+            timestamp = datetime.datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-        append_alert(
-            ALERT_FILE,
-            alert_id,
-            timestamp,
-            ip,
-            is_ioc_match,
-            failed,
-            successful,
-            severity,
-            classification,
-            mitre,
-            logs,
-        )
+            print(
+                f"{CYAN}Incident window: "
+                f"{incident_number}/"
+                f"{len(incident_windows)}{RESET}"
+            )
 
-        alert_id += 1
+            print_alert(
+                alert_id,
+                ip,
+                is_ioc_match,
+                failed,
+                successful,
+                severity,
+                classification,
+                mitre,
+                colour,
+                incident_logs,
+            )
+
+            append_alert(
+                ALERT_FILE,
+                alert_id,
+                timestamp,
+                ip,
+                is_ioc_match,
+                failed,
+                successful,
+                severity,
+                classification,
+                mitre,
+                incident_logs,
+            )
+
+            alert_id += 1
 
     generated_alerts = alert_id - 1
 
     print(f"{GREEN}Detection completed{RESET}")
-    print(f"{GREEN}Alerts generated: {generated_alerts}{RESET}")
+    print(
+        f"{GREEN}Alerts generated: "
+        f"{generated_alerts}{RESET}"
+    )
     print(f"{GREEN}CSV output: {ALERT_FILE}{RESET}")
 
 
