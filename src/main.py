@@ -16,6 +16,7 @@ RESET = "\033[0m"
 IOC_FILE = Path("data/iocs.json")
 LOG_FILE = Path("logs/sample-auth.log")
 ALERT_FILE = Path("alerts/alerts.csv")
+INCIDENT_FILE = Path("alerts/incidents.json")
 
 FEED_SOURCE = "Local IOC JSON"
 MAX_LOG_DISPLAY = 5
@@ -115,7 +116,6 @@ def create_incident_windows(
     logs: list[str],
 ) -> list[list[str]]:
     """Group log entries into incidents using a fixed time window."""
-
     parsed_logs: list[tuple[datetime.datetime, str]] = []
     unparsed_logs: list[str] = []
 
@@ -157,6 +157,7 @@ def create_incident_windows(
         incidents.append([log])
 
     return incidents
+
 
 def count_events(logs: list[str]) -> tuple[int, int]:
     """Count failed and successful SSH authentication events."""
@@ -239,11 +240,7 @@ def should_alert(
     is_ioc_match: bool,
 ) -> bool:
     """Determine whether the activity should generate an alert."""
-    return (
-        failed > 0
-        or is_ioc_match
-        or (failed > 0 and successful > 0)
-    )
+    return failed > 0 or is_ioc_match
 
 
 def write_csv_header(alert_file: Path) -> None:
@@ -362,6 +359,87 @@ def print_alert(
     print(f"{colour}{'=' * 60}{RESET}\n")
 
 
+def get_incident_time_range(
+    logs: list[str],
+) -> tuple[str | None, str | None]:
+    """Return the earliest and latest valid timestamps in an incident."""
+    timestamps = [
+        timestamp
+        for log in logs
+        if (timestamp := parse_log_timestamp(log)) is not None
+    ]
+
+    if not timestamps:
+        return None, None
+
+    timestamps.sort()
+
+    return (
+        timestamps[0].isoformat(),
+        timestamps[-1].isoformat(),
+    )
+
+
+def build_incident_record(
+    alert_id: int,
+    generated_at: str,
+    ip: str,
+    is_ioc_match: bool,
+    failed: int,
+    successful: int,
+    severity: str,
+    classification: str,
+    mitre: str,
+    logs: list[str],
+) -> dict:
+    """Build a structured JSON incident record."""
+    start_time, end_time = get_incident_time_range(logs)
+
+    return {
+        "incident_id": f"INC-{alert_id:04d}",
+        "generated_at": generated_at,
+        "source_ip": ip,
+        "ioc": {
+            "matched": is_ioc_match,
+            "source": FEED_SOURCE if is_ioc_match else None,
+        },
+        "time_window": {
+            "start": start_time,
+            "end": end_time,
+            "window_minutes": CORRELATION_WINDOW_MINUTES,
+        },
+        "event_counts": {
+            "failed_logins": failed,
+            "successful_logins": successful,
+            "total_events": len(logs),
+        },
+        "severity": severity,
+        "classification": classification,
+        "mitre_attack": [
+            technique.strip()
+            for technique in mitre.split(",")
+            if technique.strip() and technique.strip() != "N/A"
+        ],
+        "evidence": logs,
+    }
+
+
+def write_incident_json(
+    incident_file: Path,
+    incidents: list[dict],
+) -> None:
+    """Write structured incident records to a JSON file."""
+    incident_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with incident_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            incidents,
+            file,
+            indent=4,
+            ensure_ascii=False,
+        )
+
+
 def main() -> None:
     malicious_ips = load_iocs(IOC_FILE)
     log_lines = read_logs(LOG_FILE)
@@ -379,6 +457,7 @@ def main() -> None:
     write_csv_header(ALERT_FILE)
 
     alert_id = 1
+    incident_records: list[dict] = []
 
     for ip, logs in ip_logs.items():
         is_ioc_match = ip in malicious_ips
@@ -440,7 +519,27 @@ def main() -> None:
                 incident_logs,
             )
 
+            incident_records.append(
+                build_incident_record(
+                    alert_id,
+                    timestamp,
+                    ip,
+                    is_ioc_match,
+                    failed,
+                    successful,
+                    severity,
+                    classification,
+                    mitre,
+                    incident_logs,
+                )
+            )
+
             alert_id += 1
+
+    write_incident_json(
+        INCIDENT_FILE,
+        incident_records,
+    )
 
     generated_alerts = alert_id - 1
 
@@ -450,6 +549,7 @@ def main() -> None:
         f"{generated_alerts}{RESET}"
     )
     print(f"{GREEN}CSV output: {ALERT_FILE}{RESET}")
+    print(f"{GREEN}JSON output: {INCIDENT_FILE}{RESET}")
 
 
 if __name__ == "__main__":
