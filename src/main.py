@@ -115,16 +115,17 @@ def create_incident_windows(
     logs: list[str],
 ) -> list[list[str]]:
     """Group log entries into incidents using a fixed time window."""
+
     parsed_logs: list[tuple[datetime.datetime, str]] = []
+    unparsed_logs: list[str] = []
 
     for log in logs:
         timestamp = parse_log_timestamp(log)
 
         if timestamp is not None:
             parsed_logs.append((timestamp, log))
-
-    if not parsed_logs:
-        return [logs] if logs else []
+        else:
+            unparsed_logs.append(log)
 
     parsed_logs.sort(key=lambda item: item[0])
 
@@ -152,8 +153,10 @@ def create_incident_windows(
     if current_incident:
         incidents.append(current_incident)
 
-    return incidents
+    for log in unparsed_logs:
+        incidents.append([log])
 
+    return incidents
 
 def count_events(logs: list[str]) -> tuple[int, int]:
     """Count failed and successful SSH authentication events."""
