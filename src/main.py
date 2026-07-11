@@ -1,5 +1,6 @@
 import csv
 import datetime
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -17,11 +18,13 @@ IOC_FILE = Path("data/iocs.json")
 LOG_FILE = Path("logs/sample-auth.log")
 ALERT_FILE = Path("alerts/alerts.csv")
 INCIDENT_FILE = Path("alerts/incidents.json")
+DEDUP_STATE_FILE = Path("alerts/dedup-state.json")
 
 FEED_SOURCE = "Local IOC JSON"
 MAX_LOG_DISPLAY = 5
 BRUTE_FORCE_THRESHOLD = 5
 CORRELATION_WINDOW_MINUTES = 5
+DEDUP_COOLDOWN_MINUTES = 30
 
 
 def load_iocs(ioc_file: Path) -> set[str]:
@@ -61,8 +64,10 @@ def read_logs(log_file: Path) -> list[str]:
         raise SystemExit(1)
 
 
-def extract_ip_logs(log_lines: list[str]) -> dict[str, list[str]]:
-    """Group relevant authentication log entries by source IP address."""
+def extract_ip_logs(
+    log_lines: list[str],
+) -> dict[str, list[str]]:
+    """Group relevant authentication log entries by source IP."""
     ip_pattern = re.compile(
         r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)"
         r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"
@@ -83,7 +88,9 @@ def extract_ip_logs(log_lines: list[str]) -> dict[str, list[str]]:
     return grouped_logs
 
 
-def parse_log_timestamp(log: str) -> datetime.datetime | None:
+def parse_log_timestamp(
+    log: str,
+) -> datetime.datetime | None:
     """Parse a standard Ubuntu syslog timestamp."""
     timestamp_pattern = re.compile(
         r"^(?P<month>[A-Z][a-z]{2})\s+"
@@ -116,7 +123,10 @@ def create_incident_windows(
     logs: list[str],
 ) -> list[list[str]]:
     """Group log entries into incidents using a fixed time window."""
-    parsed_logs: list[tuple[datetime.datetime, str]] = []
+    parsed_logs: list[
+        tuple[datetime.datetime, str]
+    ] = []
+
     unparsed_logs: list[str] = []
 
     for log in logs:
@@ -159,11 +169,16 @@ def create_incident_windows(
     return incidents
 
 
-def count_events(logs: list[str]) -> tuple[int, int]:
+def count_events(
+    logs: list[str],
+) -> tuple[int, int]:
     """Count failed and successful SSH authentication events."""
     failed = 0
     successful = 0
-    repeat_pattern = re.compile(r"message repeated (\d+) times")
+
+    repeat_pattern = re.compile(
+        r"message repeated (\d+) times"
+    )
 
     for log in logs:
         if "Failed password" in log:
@@ -231,7 +246,12 @@ def classify_activity(
         mitre = "N/A"
         colour = CYAN
 
-    return severity, classification, mitre, colour
+    return (
+        severity,
+        classification,
+        mitre,
+        colour,
+    )
 
 
 def should_alert(
@@ -239,13 +259,18 @@ def should_alert(
     successful: int,
     is_ioc_match: bool,
 ) -> bool:
-    """Determine whether the activity should generate an alert."""
+    """Determine whether activity should generate an alert."""
     return failed > 0 or is_ioc_match
 
 
-def write_csv_header(alert_file: Path) -> None:
+def write_csv_header(
+    alert_file: Path,
+) -> None:
     """Create the alert CSV file and write its header."""
-    alert_file.parent.mkdir(parents=True, exist_ok=True)
+    alert_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     with alert_file.open(
         "w",
@@ -298,7 +323,11 @@ def append_alert(
                 timestamp,
                 ip,
                 "Yes" if is_ioc_match else "No",
-                FEED_SOURCE if is_ioc_match else "N/A",
+                (
+                    FEED_SOURCE
+                    if is_ioc_match
+                    else "N/A"
+                ),
                 failed,
                 successful,
                 severity,
@@ -322,51 +351,101 @@ def print_alert(
     logs: list[str],
 ) -> None:
     """Display a readable alert in the terminal."""
-    print(f"{colour}{'=' * 60}{RESET}")
-    print(f"{colour}ALERT #{alert_id}{RESET}")
-    print(f"{colour}{'-' * 60}{RESET}")
+    print(
+        f"{colour}"
+        f"{'=' * 60}"
+        f"{RESET}"
+    )
 
-    print(f"{CYAN}Source IP:{RESET} {ip}")
+    print(
+        f"{colour}"
+        f"ALERT #{alert_id}"
+        f"{RESET}"
+    )
+
+    print(
+        f"{colour}"
+        f"{'-' * 60}"
+        f"{RESET}"
+    )
+
+    print(
+        f"{CYAN}Source IP:{RESET} "
+        f"{ip}"
+    )
+
     print(
         f"{CYAN}IOC Match:{RESET} "
         f"{'Yes' if is_ioc_match else 'No'}"
     )
+
     print(
         f"{CYAN}IOC Source:{RESET} "
         f"{FEED_SOURCE if is_ioc_match else 'N/A'}"
     )
-    print(f"{CYAN}Failed Attempts:{RESET} {failed}")
-    print(f"{CYAN}Successful Logins:{RESET} {successful}")
-    print(f"{CYAN}Severity:{RESET} {severity}")
-    print(f"{CYAN}Classification:{RESET} {classification}")
-    print(f"{CYAN}MITRE ATT&CK:{RESET} {mitre}")
+
+    print(
+        f"{CYAN}Failed Attempts:{RESET} "
+        f"{failed}"
+    )
+
+    print(
+        f"{CYAN}Successful Logins:{RESET} "
+        f"{successful}"
+    )
+
+    print(
+        f"{CYAN}Severity:{RESET} "
+        f"{severity}"
+    )
+
+    print(
+        f"{CYAN}Classification:{RESET} "
+        f"{classification}"
+    )
+
+    print(
+        f"{CYAN}MITRE ATT&CK:{RESET} "
+        f"{mitre}"
+    )
 
     print(
         f"\n{CYAN}Evidence — last "
-        f"{MAX_LOG_DISPLAY} entries:{RESET}"
+        f"{MAX_LOG_DISPLAY} entries:"
+        f"{RESET}"
     )
 
     for log in logs[-MAX_LOG_DISPLAY:]:
         print(f"  - {log}")
 
     if len(logs) > MAX_LOG_DISPLAY:
-        hidden_count = len(logs) - MAX_LOG_DISPLAY
-        print(
-            f"{CYAN}... "
-            f"({hidden_count} more logs hidden){RESET}"
+        hidden_count = (
+            len(logs) - MAX_LOG_DISPLAY
         )
 
-    print(f"{colour}{'=' * 60}{RESET}\n")
+        print(
+            f"{CYAN}... "
+            f"({hidden_count} more logs hidden)"
+            f"{RESET}"
+        )
+
+    print(
+        f"{colour}"
+        f"{'=' * 60}"
+        f"{RESET}\n"
+    )
 
 
 def get_incident_time_range(
     logs: list[str],
 ) -> tuple[str | None, str | None]:
-    """Return the earliest and latest valid timestamps in an incident."""
+    """Return earliest and latest valid incident timestamps."""
     timestamps = [
         timestamp
         for log in logs
-        if (timestamp := parse_log_timestamp(log)) is not None
+        if (
+            timestamp := parse_log_timestamp(log)
+        ) is not None
     ]
 
     if not timestamps:
@@ -393,7 +472,9 @@ def build_incident_record(
     logs: list[str],
 ) -> dict:
     """Build a structured JSON incident record."""
-    start_time, end_time = get_incident_time_range(logs)
+    start_time, end_time = (
+        get_incident_time_range(logs)
+    )
 
     return {
         "incident_id": f"INC-{alert_id:04d}",
@@ -401,12 +482,18 @@ def build_incident_record(
         "source_ip": ip,
         "ioc": {
             "matched": is_ioc_match,
-            "source": FEED_SOURCE if is_ioc_match else None,
+            "source": (
+                FEED_SOURCE
+                if is_ioc_match
+                else None
+            ),
         },
         "time_window": {
             "start": start_time,
             "end": end_time,
-            "window_minutes": CORRELATION_WINDOW_MINUTES,
+            "window_minutes": (
+                CORRELATION_WINDOW_MINUTES
+            ),
         },
         "event_counts": {
             "failed_logins": failed,
@@ -418,7 +505,10 @@ def build_incident_record(
         "mitre_attack": [
             technique.strip()
             for technique in mitre.split(",")
-            if technique.strip() and technique.strip() != "N/A"
+            if (
+                technique.strip()
+                and technique.strip() != "N/A"
+            )
         ],
         "evidence": logs,
     }
@@ -428,10 +518,16 @@ def write_incident_json(
     incident_file: Path,
     incidents: list[dict],
 ) -> None:
-    """Write structured incident records to a JSON file."""
-    incident_file.parent.mkdir(parents=True, exist_ok=True)
+    """Write structured incident records to JSON."""
+    incident_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    with incident_file.open("w", encoding="utf-8") as file:
+    with incident_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
         json.dump(
             incidents,
             file,
@@ -440,34 +536,215 @@ def write_incident_json(
         )
 
 
+def create_incident_fingerprint(
+    incident: dict,
+) -> str:
+    """Create a stable fingerprint for an incident."""
+    fingerprint_data = {
+        "source_ip": incident["source_ip"],
+        "classification": (
+            incident["classification"]
+        ),
+        "time_window": (
+            incident["time_window"]
+        ),
+        "evidence": incident["evidence"],
+    }
+
+    encoded_data = json.dumps(
+        fingerprint_data,
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    return hashlib.sha256(
+        encoded_data
+    ).hexdigest()
+
+
+def load_dedup_state(
+    state_file: Path,
+) -> dict:
+    """Load persistent deduplication state."""
+    if not state_file.exists():
+        return {}
+
+    try:
+        with state_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            state = json.load(file)
+
+        if not isinstance(state, dict):
+            return {}
+
+        return state
+
+    except (
+        json.JSONDecodeError,
+        OSError,
+    ):
+        return {}
+
+
+def save_dedup_state(
+    state_file: Path,
+    state: dict,
+) -> None:
+    """Save persistent deduplication state."""
+    state_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with state_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            state,
+            file,
+            indent=4,
+            ensure_ascii=False,
+        )
+
+
+def is_duplicate_incident(
+    fingerprint: str,
+    dedup_state: dict,
+    current_time: datetime.datetime,
+) -> bool:
+    """
+    Return True when an incident is inside
+    the deduplication cooldown period.
+    """
+    previous = dedup_state.get(
+        fingerprint
+    )
+
+    if previous is None:
+        dedup_state[fingerprint] = {
+            "last_seen": (
+                current_time.isoformat()
+            ),
+            "repeat_count": 1,
+        }
+
+        return False
+
+    try:
+        last_seen = (
+            datetime.datetime.fromisoformat(
+                previous["last_seen"]
+            )
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        dedup_state[fingerprint] = {
+            "last_seen": (
+                current_time.isoformat()
+            ),
+            "repeat_count": 1,
+        }
+
+        return False
+
+    time_difference = (
+        current_time - last_seen
+    )
+
+    previous["repeat_count"] = (
+        previous.get(
+            "repeat_count",
+            1,
+        )
+        + 1
+    )
+
+    if time_difference <= datetime.timedelta(
+        minutes=DEDUP_COOLDOWN_MINUTES
+    ):
+        return True
+
+    previous["last_seen"] = (
+        current_time.isoformat()
+    )
+
+    return False
+
+
 def main() -> None:
-    malicious_ips = load_iocs(IOC_FILE)
-    log_lines = read_logs(LOG_FILE)
-    ip_logs = extract_ip_logs(log_lines)
+    malicious_ips = load_iocs(
+        IOC_FILE
+    )
+
+    log_lines = read_logs(
+        LOG_FILE
+    )
+
+    ip_logs = extract_ip_logs(
+        log_lines
+    )
 
     print(
         f"{CYAN}========== "
         f"IOC Detection Engine v2 "
         f"=========={RESET}\n"
     )
-    print(f"Log source: {LOG_FILE}")
-    print(f"IOC source: {IOC_FILE}")
-    print(f"Observed IPs: {len(ip_logs)}\n")
 
-    write_csv_header(ALERT_FILE)
+    print(
+        f"Log source: {LOG_FILE}"
+    )
+
+    print(
+        f"IOC source: {IOC_FILE}"
+    )
+
+    print(
+        f"Observed IPs: "
+        f"{len(ip_logs)}\n"
+    )
+
+    write_csv_header(
+        ALERT_FILE
+    )
 
     alert_id = 1
+
     incident_records: list[dict] = []
 
-    for ip, logs in ip_logs.items():
-        is_ioc_match = ip in malicious_ips
-        incident_windows = create_incident_windows(logs)
+    dedup_state = load_dedup_state(
+        DEDUP_STATE_FILE
+    )
 
-        for incident_number, incident_logs in enumerate(
+    suppressed_duplicates = 0
+
+    for ip, logs in ip_logs.items():
+        is_ioc_match = (
+            ip in malicious_ips
+        )
+
+        incident_windows = (
+            create_incident_windows(logs)
+        )
+
+        for (
+            incident_number,
+            incident_logs,
+        ) in enumerate(
             incident_windows,
             start=1,
         ):
-            failed, successful = count_events(incident_logs)
+            failed, successful = (
+                count_events(
+                    incident_logs
+                )
+            )
 
             if not should_alert(
                 failed,
@@ -476,20 +753,61 @@ def main() -> None:
             ):
                 continue
 
-            severity, classification, mitre, colour = classify_activity(
+            (
+                severity,
+                classification,
+                mitre,
+                colour,
+            ) = classify_activity(
                 failed,
                 successful,
                 is_ioc_match,
             )
 
-            timestamp = datetime.datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
+            current_time = (
+                datetime.datetime.now()
             )
+
+            timestamp = (
+                current_time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            )
+
+            incident_record = (
+                build_incident_record(
+                    alert_id,
+                    timestamp,
+                    ip,
+                    is_ioc_match,
+                    failed,
+                    successful,
+                    severity,
+                    classification,
+                    mitre,
+                    incident_logs,
+                )
+            )
+
+            fingerprint = (
+                create_incident_fingerprint(
+                    incident_record
+                )
+            )
+
+            if is_duplicate_incident(
+                fingerprint,
+                dedup_state,
+                current_time,
+            ):
+                suppressed_duplicates += 1
+                continue
 
             print(
                 f"{CYAN}Incident window: "
                 f"{incident_number}/"
-                f"{len(incident_windows)}{RESET}"
+                f"{len(incident_windows)}"
+                f"{RESET}"
             )
 
             print_alert(
@@ -520,36 +838,58 @@ def main() -> None:
             )
 
             incident_records.append(
-                build_incident_record(
-                    alert_id,
-                    timestamp,
-                    ip,
-                    is_ioc_match,
-                    failed,
-                    successful,
-                    severity,
-                    classification,
-                    mitre,
-                    incident_logs,
-                )
+                incident_record
             )
 
             alert_id += 1
+
+    save_dedup_state(
+        DEDUP_STATE_FILE,
+        dedup_state,
+    )
 
     write_incident_json(
         INCIDENT_FILE,
         incident_records,
     )
 
-    generated_alerts = alert_id - 1
-
-    print(f"{GREEN}Detection completed{RESET}")
-    print(
-        f"{GREEN}Alerts generated: "
-        f"{generated_alerts}{RESET}"
+    generated_alerts = (
+        alert_id - 1
     )
-    print(f"{GREEN}CSV output: {ALERT_FILE}{RESET}")
-    print(f"{GREEN}JSON output: {INCIDENT_FILE}{RESET}")
+
+    print(
+        f"{GREEN}"
+        f"Detection completed"
+        f"{RESET}"
+    )
+
+    print(
+        f"{GREEN}"
+        f"Alerts generated: "
+        f"{generated_alerts}"
+        f"{RESET}"
+    )
+
+    print(
+        f"{GREEN}"
+        f"CSV output: "
+        f"{ALERT_FILE}"
+        f"{RESET}"
+    )
+
+    print(
+        f"{GREEN}"
+        f"JSON output: "
+        f"{INCIDENT_FILE}"
+        f"{RESET}"
+    )
+
+    print(
+        f"{GREEN}"
+        f"Duplicates suppressed: "
+        f"{suppressed_duplicates}"
+        f"{RESET}"
+    )
 
 
 if __name__ == "__main__":
