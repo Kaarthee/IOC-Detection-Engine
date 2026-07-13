@@ -120,3 +120,120 @@ def normalize_ubuntu_auth_logs(
             events.append(event)
 
     return events
+
+def group_events_by_source_ip(
+    events: list[SecurityEvent],
+) -> dict[str, list[SecurityEvent]]:
+    """Group normalized security events by source IP."""
+    grouped_events: dict[
+        str,
+        list[SecurityEvent],
+    ] = {}
+
+    for event in events:
+        grouped_events.setdefault(
+            event.source_ip,
+            [],
+        ).append(event)
+
+    return grouped_events
+
+
+def create_normalized_event_windows(
+    events: list[SecurityEvent],
+    window_minutes: int = 5,
+) -> list[list[SecurityEvent]]:
+    """Group normalized events into fixed time windows."""
+    parsed_events: list[
+        tuple[datetime.datetime, SecurityEvent]
+    ] = []
+
+    unparsed_events: list[SecurityEvent] = []
+
+    for event in events:
+        if event.timestamp is None:
+            unparsed_events.append(event)
+            continue
+
+        try:
+            parsed_timestamp = (
+                datetime.datetime.fromisoformat(
+                    event.timestamp
+                )
+            )
+        except ValueError:
+            unparsed_events.append(event)
+            continue
+
+        parsed_events.append(
+            (
+                parsed_timestamp,
+                event,
+            )
+        )
+
+    parsed_events.sort(
+        key=lambda item: item[0]
+    )
+
+    windows: list[list[SecurityEvent]] = []
+    current_window: list[SecurityEvent] = []
+    window_start: datetime.datetime | None = None
+
+    for timestamp, event in parsed_events:
+        if window_start is None:
+            window_start = timestamp
+            current_window = [event]
+            continue
+
+        time_difference = (
+            timestamp - window_start
+        )
+
+        if time_difference <= datetime.timedelta(
+            minutes=window_minutes
+        ):
+            current_window.append(event)
+        else:
+            windows.append(current_window)
+            current_window = [event]
+            window_start = timestamp
+
+    if current_window:
+        windows.append(current_window)
+
+    for event in unparsed_events:
+        windows.append([event])
+
+    return windows
+
+
+def count_normalized_events(
+    events: list[SecurityEvent],
+) -> tuple[int, int]:
+    """Count normalized authentication failures and successes."""
+    failed = sum(
+        1
+        for event in events
+        if event.event_type
+        == "authentication_failure"
+    )
+
+    successful = sum(
+        1
+        for event in events
+        if event.event_type
+        == "authentication_success"
+    )
+
+    return failed, successful
+
+
+def normalized_events_to_raw_logs(
+    events: list[SecurityEvent],
+) -> list[str]:
+    """Return original raw logs for alert evidence."""
+    return [
+        event.raw_log
+        for event in events
+    ]

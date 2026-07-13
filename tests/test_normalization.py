@@ -2,6 +2,10 @@ import datetime
 import unittest
 
 from src.normalization import (
+    count_normalized_events,
+    create_normalized_event_windows,
+    group_events_by_source_ip,
+    normalized_events_to_raw_logs,
     SecurityEvent,
     normalize_ubuntu_auth_log,
     normalize_ubuntu_auth_logs,
@@ -204,6 +208,203 @@ class TestUbuntuAuthNormalization(unittest.TestCase):
             event_dict,
         )
 
+class TestNormalizedEventProcessing(unittest.TestCase):
+    def create_event(
+        self,
+        timestamp,
+        source_ip,
+        event_type,
+        raw_log,
+    ):
+        return SecurityEvent(
+            timestamp=timestamp,
+            source_ip=source_ip,
+            event_type=event_type,
+            username="test",
+            source="ubuntu_auth",
+            destination_port=22,
+            protocol="ssh",
+            raw_log=raw_log,
+        )
+
+    def test_events_group_by_source_ip(self):
+        events = [
+            self.create_event(
+                "2026-04-28T10:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-one",
+            ),
+            self.create_event(
+                "2026-04-28T10:01:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-two",
+            ),
+            self.create_event(
+                "2026-04-28T10:02:00",
+                "192.168.1.20",
+                "authentication_success",
+                "success-one",
+            ),
+        ]
+
+        grouped = group_events_by_source_ip(events)
+
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(
+            len(grouped["192.168.1.10"]),
+            2,
+        )
+        self.assertEqual(
+            len(grouped["192.168.1.20"]),
+            1,
+        )
+
+    def test_events_inside_window_are_grouped(self):
+        events = [
+            self.create_event(
+                "2026-04-28T12:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-one",
+            ),
+            self.create_event(
+                "2026-04-28T12:05:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-two",
+            ),
+        ]
+
+        windows = create_normalized_event_windows(events)
+
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(len(windows[0]), 2)
+
+    def test_event_after_window_starts_new_incident(self):
+        events = [
+            self.create_event(
+                "2026-04-28T12:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-one",
+            ),
+            self.create_event(
+                "2026-04-28T12:05:01",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-two",
+            ),
+        ]
+
+        windows = create_normalized_event_windows(events)
+
+        self.assertEqual(len(windows), 2)
+
+    def test_events_are_sorted_before_correlation(self):
+        events = [
+            self.create_event(
+                "2026-04-28T13:04:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "later-event",
+            ),
+            self.create_event(
+                "2026-04-28T13:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "earlier-event",
+            ),
+        ]
+
+        windows = create_normalized_event_windows(events)
+
+        self.assertEqual(
+            windows[0][0].raw_log,
+            "earlier-event",
+        )
+        self.assertEqual(
+            windows[0][1].raw_log,
+            "later-event",
+        )
+
+    def test_event_without_timestamp_is_isolated(self):
+        events = [
+            self.create_event(
+                "2026-04-28T14:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "valid-event",
+            ),
+            self.create_event(
+                None,
+                "192.168.1.10",
+                "authentication_failure",
+                "invalid-time-event",
+            ),
+        ]
+
+        windows = create_normalized_event_windows(events)
+
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(
+            windows[1][0].raw_log,
+            "invalid-time-event",
+        )
+
+    def test_normalized_event_counts(self):
+        events = [
+            self.create_event(
+                "2026-04-28T15:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-one",
+            ),
+            self.create_event(
+                "2026-04-28T15:01:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "failure-two",
+            ),
+            self.create_event(
+                "2026-04-28T15:02:00",
+                "192.168.1.10",
+                "authentication_success",
+                "success-one",
+            ),
+        ]
+
+        failed, successful = count_normalized_events(events)
+
+        self.assertEqual(failed, 2)
+        self.assertEqual(successful, 1)
+
+    def test_raw_logs_are_preserved_as_evidence(self):
+        events = [
+            self.create_event(
+                "2026-04-28T16:00:00",
+                "192.168.1.10",
+                "authentication_failure",
+                "original-log-one",
+            ),
+            self.create_event(
+                "2026-04-28T16:01:00",
+                "192.168.1.10",
+                "authentication_success",
+                "original-log-two",
+            ),
+        ]
+
+        raw_logs = normalized_events_to_raw_logs(events)
+
+        self.assertEqual(
+            raw_logs,
+            [
+                "original-log-one",
+                "original-log-two",
+            ],
+        )
 
 if __name__ == "__main__":
     unittest.main()
