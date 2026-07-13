@@ -20,32 +20,64 @@ ALERT_FILE = Path("alerts/alerts.csv")
 INCIDENT_FILE = Path("alerts/incidents.json")
 DEDUP_STATE_FILE = Path("alerts/dedup-state.json")
 
-FEED_SOURCE = "Local IOC JSON"
 MAX_LOG_DISPLAY = 5
 BRUTE_FORCE_THRESHOLD = 5
 CORRELATION_WINDOW_MINUTES = 5
 DEDUP_COOLDOWN_MINUTES = 30
 
 
-def load_iocs(ioc_file: Path) -> set[str]:
-    """Load malicious IP addresses from the local IOC JSON feed."""
+def load_iocs(ioc_file: Path) -> dict[str, dict]:
+    """Load active, non-expired IOC records from the local JSON feed."""
     try:
         with ioc_file.open("r", encoding="utf-8") as file:
             data = json.load(file)
 
-        malicious_ips = data.get("malicious_ips", [])
+        indicators = data.get("indicators", [])
 
-        if not isinstance(malicious_ips, list):
-            raise ValueError("'malicious_ips' must be a list")
+        if not isinstance(indicators, list):
+            raise ValueError("'indicators' must be a list")
 
-        return set(malicious_ips)
+        active_iocs: dict[str, dict] = {}
+        current_time = datetime.datetime.now()
+
+        for indicator in indicators:
+            if not isinstance(indicator, dict):
+                continue
+
+            value = indicator.get("value")
+
+            if not value or not indicator.get("active", False):
+                continue
+
+            expires_at = indicator.get("expires_at")
+
+            if expires_at:
+                try:
+                    expiry_time = datetime.datetime.fromisoformat(
+                        expires_at
+                    )
+                except ValueError:
+                    continue
+
+                if expiry_time < current_time:
+                    continue
+
+            active_iocs[value] = indicator
+
+        return active_iocs
 
     except FileNotFoundError:
-        print(f"{RED}Error: IOC file not found: {ioc_file}{RESET}")
+        print(
+            f"{RED}Error: IOC file not found: "
+            f"{ioc_file}{RESET}"
+        )
         raise SystemExit(1)
 
     except (json.JSONDecodeError, ValueError) as error:
-        print(f"{RED}Error: Invalid IOC file: {error}{RESET}")
+        print(
+            f"{RED}Error: Invalid IOC file: "
+            f"{error}{RESET}"
+        )
         raise SystemExit(1)
 
 
@@ -60,7 +92,10 @@ def read_logs(log_file: Path) -> list[str]:
             return file.readlines()
 
     except FileNotFoundError:
-        print(f"{RED}Error: Log file not found: {log_file}{RESET}")
+        print(
+            f"{RED}Error: Log file not found: "
+            f"{log_file}{RESET}"
+        )
         raise SystemExit(1)
 
 
@@ -92,13 +127,13 @@ def parse_log_timestamp(
     log: str,
 ) -> datetime.datetime | None:
     """Parse a standard Ubuntu syslog timestamp."""
-    timestamp_pattern = re.compile(
+    pattern = re.compile(
         r"^(?P<month>[A-Z][a-z]{2})\s+"
         r"(?P<day>\d{1,2})\s+"
         r"(?P<time>\d{2}:\d{2}:\d{2})"
     )
 
-    match = timestamp_pattern.search(log)
+    match = pattern.search(log)
 
     if not match:
         return None
@@ -122,7 +157,7 @@ def parse_log_timestamp(
 def create_incident_windows(
     logs: list[str],
 ) -> list[list[str]]:
-    """Group log entries into incidents using a fixed time window."""
+    """Group log entries into fixed five-minute incidents."""
     parsed_logs: list[
         tuple[datetime.datetime, str]
     ] = []
@@ -132,12 +167,19 @@ def create_incident_windows(
     for log in logs:
         timestamp = parse_log_timestamp(log)
 
-        if timestamp is not None:
-            parsed_logs.append((timestamp, log))
-        else:
+        if timestamp is None:
             unparsed_logs.append(log)
+        else:
+            parsed_logs.append(
+                (
+                    timestamp,
+                    log,
+                )
+            )
 
-    parsed_logs.sort(key=lambda item: item[0])
+    parsed_logs.sort(
+        key=lambda item: item[0]
+    )
 
     incidents: list[list[str]] = []
     current_incident: list[str] = []
@@ -149,7 +191,9 @@ def create_incident_windows(
             current_incident = [log]
             continue
 
-        time_difference = timestamp - window_start
+        time_difference = (
+            timestamp - window_start
+        )
 
         if time_difference <= datetime.timedelta(
             minutes=CORRELATION_WINDOW_MINUTES
@@ -200,57 +244,61 @@ def classify_activity(
     successful: int,
     is_ioc_match: bool,
 ) -> tuple[str, str, str, str]:
-    """
-    Return severity, classification, MITRE ATT&CK mapping
-    and display colour.
-    """
+    """Return severity, classification, MITRE mapping and colour."""
+
     if failed > 0 and successful > 0:
-        severity = "CRITICAL"
-        classification = "Brute Force → Successful Login"
-        mitre = "T1110, T1078"
-        colour = YELLOW
+        return (
+            "CRITICAL",
+            "Brute Force → Successful Login",
+            "T1110, T1078",
+            YELLOW,
+        )
 
-    elif failed >= BRUTE_FORCE_THRESHOLD:
-        severity = "HIGH"
-        classification = "SSH Brute Force"
-        mitre = "T1110"
-        colour = RED
+    if failed >= BRUTE_FORCE_THRESHOLD:
+        return (
+            "HIGH",
+            "SSH Brute Force",
+            "T1110",
+            RED,
+        )
 
-    elif successful > 0 and is_ioc_match:
-        severity = "CRITICAL"
-        classification = "Known IOC Successful Login"
-        mitre = "T1078"
-        colour = YELLOW
+    if successful > 0 and is_ioc_match:
+        return (
+            "CRITICAL",
+            "Known IOC Successful Login",
+            "T1078",
+            YELLOW,
+        )
 
-    elif successful > 0:
-        severity = "LOW"
-        classification = "Successful Login"
-        mitre = "T1078"
-        colour = GREEN
+    if successful > 0:
+        return (
+            "LOW",
+            "Successful Login",
+            "T1078",
+            GREEN,
+        )
 
-    elif failed > 0 and is_ioc_match:
-        severity = "HIGH"
-        classification = "IOC-Matched Login Failures"
-        mitre = "T1110"
-        colour = RED
+    if failed > 0 and is_ioc_match:
+        return (
+            "HIGH",
+            "IOC-Matched Login Failures",
+            "T1110",
+            RED,
+        )
 
-    elif failed > 0:
-        severity = "MEDIUM"
-        classification = "Login Failures"
-        mitre = "T1110"
-        colour = CYAN
-
-    else:
-        severity = "INFO"
-        classification = "No Relevant Activity"
-        mitre = "N/A"
-        colour = CYAN
+    if failed > 0:
+        return (
+            "MEDIUM",
+            "Login Failures",
+            "T1110",
+            CYAN,
+        )
 
     return (
-        severity,
-        classification,
-        mitre,
-        colour,
+        "INFO",
+        "No Relevant Activity",
+        "N/A",
+        CYAN,
     )
 
 
@@ -286,6 +334,12 @@ def write_csv_header(
                 "IP",
                 "IOC Match",
                 "IOC Source",
+                "IOC Confidence",
+                "Source Reliability",
+                "IOC Tags",
+                "First Seen",
+                "Last Seen",
+                "Expires At",
                 "Failed Attempts",
                 "Successful Logins",
                 "Severity",
@@ -308,8 +362,12 @@ def append_alert(
     classification: str,
     mitre: str,
     logs: list[str],
+    ioc_record: dict | None = None,
 ) -> None:
-    """Append a structured alert to the CSV file."""
+    """Append a structured enriched alert to the CSV file."""
+    ioc_record = ioc_record or {}
+    tags = ioc_record.get("tags", [])
+
     with alert_file.open(
         "a",
         newline="",
@@ -323,10 +381,34 @@ def append_alert(
                 timestamp,
                 ip,
                 "Yes" if is_ioc_match else "No",
+                ioc_record.get(
+                    "source",
+                    "N/A",
+                ),
+                ioc_record.get(
+                    "confidence",
+                    "N/A",
+                ),
+                ioc_record.get(
+                    "source_reliability",
+                    "N/A",
+                ),
                 (
-                    FEED_SOURCE
-                    if is_ioc_match
+                    ", ".join(tags)
+                    if tags
                     else "N/A"
+                ),
+                ioc_record.get(
+                    "first_seen",
+                    "N/A",
+                ),
+                ioc_record.get(
+                    "last_seen",
+                    "N/A",
+                ),
+                ioc_record.get(
+                    "expires_at",
+                    "N/A",
                 ),
                 failed,
                 successful,
@@ -349,8 +431,9 @@ def print_alert(
     mitre: str,
     colour: str,
     logs: list[str],
+    ioc_record: dict | None = None,
 ) -> None:
-    """Display a readable alert in the terminal."""
+    """Display an enriched alert in the terminal."""
     print(
         f"{colour}"
         f"{'=' * 60}"
@@ -379,10 +462,46 @@ def print_alert(
         f"{'Yes' if is_ioc_match else 'No'}"
     )
 
-    print(
-        f"{CYAN}IOC Source:{RESET} "
-        f"{FEED_SOURCE if is_ioc_match else 'N/A'}"
-    )
+    if ioc_record:
+        print(
+            f"{CYAN}IOC Source:{RESET} "
+            f"{ioc_record.get('source', 'N/A')}"
+        )
+
+        print(
+            f"{CYAN}IOC Confidence:{RESET} "
+            f"{ioc_record.get('confidence', 'N/A')}"
+        )
+
+        print(
+            f"{CYAN}Source Reliability:{RESET} "
+            f"{ioc_record.get('source_reliability', 'N/A')}"
+        )
+
+        print(
+            f"{CYAN}IOC Tags:{RESET} "
+            f"{', '.join(ioc_record.get('tags', [])) or 'N/A'}"
+        )
+
+        print(
+            f"{CYAN}First Seen:{RESET} "
+            f"{ioc_record.get('first_seen', 'N/A')}"
+        )
+
+        print(
+            f"{CYAN}Last Seen:{RESET} "
+            f"{ioc_record.get('last_seen', 'N/A')}"
+        )
+
+        print(
+            f"{CYAN}Expires At:{RESET} "
+            f"{ioc_record.get('expires_at', 'N/A')}"
+        )
+    else:
+        print(
+            f"{CYAN}IOC Source:{RESET} "
+            f"N/A"
+        )
 
     print(
         f"{CYAN}Failed Attempts:{RESET} "
@@ -470,24 +589,69 @@ def build_incident_record(
     classification: str,
     mitre: str,
     logs: list[str],
+    ioc_record: dict | None = None,
 ) -> dict:
-    """Build a structured JSON incident record."""
+    """Build a structured enriched JSON incident record."""
     start_time, end_time = (
         get_incident_time_range(logs)
     )
+
+    ioc_context = {
+        "matched": is_ioc_match,
+        "value": None,
+        "type": None,
+        "source": None,
+        "confidence": None,
+        "source_reliability": None,
+        "first_seen": None,
+        "last_seen": None,
+        "expires_at": None,
+        "active": False,
+        "tags": [],
+    }
+
+    if ioc_record:
+        ioc_context = {
+            "matched": True,
+            "value": ioc_record.get(
+                "value"
+            ),
+            "type": ioc_record.get(
+                "type"
+            ),
+            "source": ioc_record.get(
+                "source"
+            ),
+            "confidence": ioc_record.get(
+                "confidence"
+            ),
+            "source_reliability": ioc_record.get(
+                "source_reliability"
+            ),
+            "first_seen": ioc_record.get(
+                "first_seen"
+            ),
+            "last_seen": ioc_record.get(
+                "last_seen"
+            ),
+            "expires_at": ioc_record.get(
+                "expires_at"
+            ),
+            "active": ioc_record.get(
+                "active",
+                False,
+            ),
+            "tags": ioc_record.get(
+                "tags",
+                [],
+            ),
+        }
 
     return {
         "incident_id": f"INC-{alert_id:04d}",
         "generated_at": generated_at,
         "source_ip": ip,
-        "ioc": {
-            "matched": is_ioc_match,
-            "source": (
-                FEED_SOURCE
-                if is_ioc_match
-                else None
-            ),
-        },
+        "ioc": ioc_context,
         "time_window": {
             "start": start_time,
             "end": end_time,
@@ -542,13 +706,15 @@ def create_incident_fingerprint(
     """Create a stable fingerprint for an incident."""
     fingerprint_data = {
         "source_ip": incident["source_ip"],
-        "classification": (
-            incident["classification"]
-        ),
-        "time_window": (
-            incident["time_window"]
-        ),
-        "evidence": incident["evidence"],
+        "classification": incident[
+            "classification"
+        ],
+        "time_window": incident[
+            "time_window"
+        ],
+        "evidence": incident[
+            "evidence"
+        ],
     }
 
     encoded_data = json.dumps(
@@ -576,10 +742,10 @@ def load_dedup_state(
         ) as file:
             state = json.load(file)
 
-        if not isinstance(state, dict):
-            return {}
+        if isinstance(state, dict):
+            return state
 
-        return state
+        return {}
 
     except (
         json.JSONDecodeError,
@@ -615,10 +781,7 @@ def is_duplicate_incident(
     dedup_state: dict,
     current_time: datetime.datetime,
 ) -> bool:
-    """
-    Return True when an incident is inside
-    the deduplication cooldown period.
-    """
+    """Return True when an incident is inside the cooldown period."""
     previous = dedup_state.get(
         fingerprint
     )
@@ -654,16 +817,16 @@ def is_duplicate_incident(
 
         return False
 
-    time_difference = (
-        current_time - last_seen
-    )
-
     previous["repeat_count"] = (
         previous.get(
             "repeat_count",
             1,
         )
         + 1
+    )
+
+    time_difference = (
+        current_time - last_seen
     )
 
     if time_difference <= datetime.timedelta(
@@ -679,7 +842,7 @@ def is_duplicate_incident(
 
 
 def main() -> None:
-    malicious_ips = load_iocs(
+    ioc_records = load_iocs(
         IOC_FILE
     )
 
@@ -698,11 +861,13 @@ def main() -> None:
     )
 
     print(
-        f"Log source: {LOG_FILE}"
+        f"Log source: "
+        f"{LOG_FILE}"
     )
 
     print(
-        f"IOC source: {IOC_FILE}"
+        f"IOC source: "
+        f"{IOC_FILE}"
     )
 
     print(
@@ -715,7 +880,6 @@ def main() -> None:
     )
 
     alert_id = 1
-
     incident_records: list[dict] = []
 
     dedup_state = load_dedup_state(
@@ -725,12 +889,18 @@ def main() -> None:
     suppressed_duplicates = 0
 
     for ip, logs in ip_logs.items():
+        ioc_record = ioc_records.get(
+            ip
+        )
+
         is_ioc_match = (
-            ip in malicious_ips
+            ioc_record is not None
         )
 
         incident_windows = (
-            create_incident_windows(logs)
+            create_incident_windows(
+                logs
+            )
         )
 
         for (
@@ -786,6 +956,7 @@ def main() -> None:
                     classification,
                     mitre,
                     incident_logs,
+                    ioc_record,
                 )
             )
 
@@ -821,6 +992,7 @@ def main() -> None:
                 mitre,
                 colour,
                 incident_logs,
+                ioc_record,
             )
 
             append_alert(
@@ -835,6 +1007,7 @@ def main() -> None:
                 classification,
                 mitre,
                 incident_logs,
+                ioc_record,
             )
 
             incident_records.append(

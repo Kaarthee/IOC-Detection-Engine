@@ -1,8 +1,67 @@
+
 {
-  "malicious_ips": [
-    "192.168.56.101",
-    "10.0.2.15",
-    "45.141.215.90",
-    "192.168.20.18"
+  "indicators": [
+    {
+      "value": "192.168.56.101",
+      "type": "ipv4",
+      "source": "Local Lab Intelligence",
+      "confidence": 95,
+      "source_reliability": "A",
+      "first_seen": "2026-04-28T10:35:11",
+      "last_seen": "2026-04-28T10:36:45",
+      "expires_at": "2026-12-31T23:59:59",
+      "active": true,
+      "tags": [
+        "ssh",
+        "brute-force",
+        "successful-login"
+      ]
+    },
+    {
+      "value": "10.0.2.15",
+      "type": "ipv4",
+      "source": "Local Lab Intelligence",
+      "confidence": 70,
+      "source_reliability": "B",
+      "first_seen": "2026-04-01T09:00:00",
+      "last_seen": "2026-04-15T11:30:00",
+      "expires_at": "2026-10-01T00:00:00",
+      "active": true,
+      "tags": [
+        "ssh",
+        "suspicious-source"
+      ]
+    },
+    {
+      "value": "45.141.215.90",
+      "type": "ipv4",
+      "source": "External Threat Feed",
+      "confidence": 90,
+      "source_reliability": "A",
+      "first_seen": "2026-04-20T08:00:00",
+      "last_seen": "2026-04-28T10:37:02",
+      "expires_at": "2026-12-31T23:59:59",
+      "active": true,
+      "tags": [
+        "ssh",
+        "brute-force",
+        "internet-scanner"
+      ]
+    },
+    {
+      "value": "192.168.20.18",
+      "type": "ipv4",
+      "source": "Historical Lab Feed",
+      "confidence": 40,
+      "source_reliability": "C",
+      "first_seen": "2025-12-01T12:00:00",
+      "last_seen": "2026-01-15T12:00:00",
+      "expires_at": "2026-03-01T00:00:00",
+      "active": false,
+      "tags": [
+        "expired",
+        "historical"
+      ]
+    }
   ]
 }
