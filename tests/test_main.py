@@ -1,5 +1,9 @@
+import csv
 import datetime
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from src.main import (
     BRUTE_FORCE_THRESHOLD,
@@ -10,9 +14,10 @@ from src.main import (
     create_incident_windows,
     get_incident_time_range,
     is_duplicate_incident,
+    load_iocs,
     parse_log_timestamp,
+    write_csv_header,
 )
-
 
 class TestTimestampParsing(unittest.TestCase):
     def test_valid_ubuntu_timestamp(self):
@@ -342,6 +347,268 @@ class TestDeduplication(unittest.TestCase):
             later_time.isoformat(),
         )
 
+class TestIocLifecycle(unittest.TestCase):
+    def write_ioc_file(
+        self,
+        directory: str,
+        indicators,
+    ) -> Path:
+        ioc_file = Path(directory) / "iocs.json"
+
+        with ioc_file.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                {
+                    "indicators": indicators,
+                },
+                file,
+            )
+
+        return ioc_file
+
+    def test_active_future_ioc_is_loaded(self):
+        indicator = {
+            "value": "203.0.113.10",
+            "type": "ipv4",
+            "source": "Test Feed",
+            "confidence": 90,
+            "source_reliability": "A",
+            "expires_at": "2999-12-31T23:59:59",
+            "active": True,
+            "tags": ["ssh"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ioc_file = self.write_ioc_file(
+                directory,
+                [indicator],
+            )
+
+            result = load_iocs(ioc_file)
+
+        self.assertIn(
+            "203.0.113.10",
+            result,
+        )
+        self.assertEqual(
+            result["203.0.113.10"]["confidence"],
+            90,
+        )
+
+    def test_inactive_ioc_is_skipped(self):
+        indicator = {
+            "value": "203.0.113.11",
+            "expires_at": "2999-12-31T23:59:59",
+            "active": False,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ioc_file = self.write_ioc_file(
+                directory,
+                [indicator],
+            )
+
+            result = load_iocs(ioc_file)
+
+        self.assertNotIn(
+            "203.0.113.11",
+            result,
+        )
+
+    def test_expired_ioc_is_skipped(self):
+        indicator = {
+            "value": "203.0.113.12",
+            "expires_at": "2000-01-01T00:00:00",
+            "active": True,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ioc_file = self.write_ioc_file(
+                directory,
+                [indicator],
+            )
+
+            result = load_iocs(ioc_file)
+
+        self.assertNotIn(
+            "203.0.113.12",
+            result,
+        )
+
+    def test_invalid_expiry_is_skipped(self):
+        indicator = {
+            "value": "203.0.113.13",
+            "expires_at": "not-a-valid-date",
+            "active": True,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ioc_file = self.write_ioc_file(
+                directory,
+                [indicator],
+            )
+
+            result = load_iocs(ioc_file)
+
+        self.assertNotIn(
+            "203.0.113.13",
+            result,
+        )
+
+    def test_invalid_indicator_schema_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ioc_file = Path(directory) / "iocs.json"
+
+            with ioc_file.open(
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(
+                    {
+                        "indicators": {
+                            "value": "203.0.113.14",
+                        },
+                    },
+                    file,
+                )
+
+            with self.assertRaises(SystemExit):
+                load_iocs(ioc_file)
+
+
+class TestIocEnrichmentOutput(unittest.TestCase):
+    def test_enriched_ioc_metadata_enters_json(self):
+        logs = [
+            (
+                "Apr 28 10:00:00 ubuntu sshd[1]: "
+                "Failed password"
+            ),
+        ]
+
+        ioc_record = {
+            "value": "203.0.113.20",
+            "type": "ipv4",
+            "source": "External Test Feed",
+            "confidence": 88,
+            "source_reliability": "A",
+            "first_seen": "2026-04-01T10:00:00",
+            "last_seen": "2026-04-28T10:00:00",
+            "expires_at": "2999-12-31T23:59:59",
+            "active": True,
+            "tags": [
+                "ssh",
+                "scanner",
+            ],
+        }
+
+        incident = build_incident_record(
+            alert_id=5,
+            generated_at="2026-07-13 20:00:00",
+            ip="203.0.113.20",
+            is_ioc_match=True,
+            failed=1,
+            successful=0,
+            severity="HIGH",
+            classification="IOC-Matched Login Failures",
+            mitre="T1110",
+            logs=logs,
+            ioc_record=ioc_record,
+        )
+
+        self.assertTrue(
+            incident["ioc"]["matched"]
+        )
+        self.assertEqual(
+            incident["ioc"]["source"],
+            "External Test Feed",
+        )
+        self.assertEqual(
+            incident["ioc"]["confidence"],
+            88,
+        )
+        self.assertEqual(
+            incident["ioc"]["source_reliability"],
+            "A",
+        )
+        self.assertEqual(
+            incident["ioc"]["tags"],
+            ["ssh", "scanner"],
+        )
+        self.assertEqual(
+            incident["ioc"]["value"],
+            "203.0.113.20",
+        )
+
+    def test_non_ioc_json_has_empty_context(self):
+        logs = [
+            (
+                "Apr 28 11:00:00 ubuntu sshd[1]: "
+                "Failed password"
+            ),
+        ]
+
+        incident = build_incident_record(
+            alert_id=6,
+            generated_at="2026-07-13 20:05:00",
+            ip="198.51.100.20",
+            is_ioc_match=False,
+            failed=1,
+            successful=0,
+            severity="MEDIUM",
+            classification="Login Failures",
+            mitre="T1110",
+            logs=logs,
+        )
+
+        self.assertFalse(
+            incident["ioc"]["matched"]
+        )
+        self.assertIsNone(
+            incident["ioc"]["source"]
+        )
+        self.assertIsNone(
+            incident["ioc"]["confidence"]
+        )
+        self.assertEqual(
+            incident["ioc"]["tags"],
+            [],
+        )
+        self.assertFalse(
+            incident["ioc"]["active"]
+        )
+
+    def test_csv_header_contains_enrichment_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            alert_file = Path(directory) / "alerts.csv"
+
+            write_csv_header(alert_file)
+
+            with alert_file.open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as file:
+                header = next(
+                    csv.reader(file)
+                )
+
+        expected_columns = [
+            "IOC Source",
+            "IOC Confidence",
+            "Source Reliability",
+            "IOC Tags",
+            "First Seen",
+            "Last Seen",
+            "Expires At",
+        ]
+
+        for column in expected_columns:
+            self.assertIn(
+                column,
+                header,
+            )
 
 if __name__ == "__main__":
     unittest.main()
