@@ -5,6 +5,22 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
+try:
+    from src.normalization import (
+        count_normalized_events,
+        create_normalized_event_windows,
+        group_events_by_source_ip,
+        normalize_ubuntu_auth_logs,
+        normalized_events_to_raw_logs,
+    )
+except ModuleNotFoundError:
+    from normalization import (
+        count_normalized_events,
+        create_normalized_event_windows,
+        group_events_by_source_ip,
+        normalize_ubuntu_auth_logs,
+        normalized_events_to_raw_logs,
+    )
 
 # -------- COLORS --------
 RED = "\033[91m"
@@ -849,9 +865,12 @@ def main() -> None:
     log_lines = read_logs(
         LOG_FILE
     )
-
-    ip_logs = extract_ip_logs(
+    normalized_events = normalize_ubuntu_auth_logs(
         log_lines
+    )
+
+    ip_events = group_events_by_source_ip(
+        normalized_events
     )
 
     print(
@@ -872,7 +891,7 @@ def main() -> None:
 
     print(
         f"Observed IPs: "
-        f"{len(ip_logs)}\n"
+        f"{len(ip_events)}\n"
     )
 
     write_csv_header(
@@ -888,7 +907,7 @@ def main() -> None:
 
     suppressed_duplicates = 0
 
-    for ip, logs in ip_logs.items():
+    for ip, events in ip_events.items():
         ioc_record = ioc_records.get(
             ip
         )
@@ -898,8 +917,9 @@ def main() -> None:
         )
 
         incident_windows = (
-            create_incident_windows(
-                logs
+            create_normalized_event_windows(
+                events,
+                CORRELATION_WINDOW_MINUTES,
             )
         )
 
@@ -910,12 +930,18 @@ def main() -> None:
             incident_windows,
             start=1,
         ):
+
             failed, successful = (
-                count_events(
+                count_normalized_events(
                     incident_logs
                 )
             )
 
+            raw_logs = (
+                normalized_events_to_raw_logs(
+                    incident_logs
+                )
+            )
             if not should_alert(
                 failed,
                 successful,
@@ -955,7 +981,7 @@ def main() -> None:
                     severity,
                     classification,
                     mitre,
-                    incident_logs,
+                    raw_logs,
                     ioc_record,
                 )
             )
@@ -991,7 +1017,7 @@ def main() -> None:
                 classification,
                 mitre,
                 colour,
-                incident_logs,
+                raw_logs,
                 ioc_record,
             )
 
@@ -1006,7 +1032,7 @@ def main() -> None:
                 severity,
                 classification,
                 mitre,
-                incident_logs,
+                raw_logs,
                 ioc_record,
             )
 
