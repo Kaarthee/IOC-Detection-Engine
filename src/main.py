@@ -5,11 +5,13 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
+
 try:
     from src.normalization import (
         count_normalized_events,
         create_normalized_event_windows,
         group_events_by_source_ip,
+        normalize_cowrie_logs,
         normalize_ubuntu_auth_logs,
         normalized_events_to_raw_logs,
     )
@@ -18,6 +20,7 @@ except ModuleNotFoundError:
         count_normalized_events,
         create_normalized_event_windows,
         group_events_by_source_ip,
+        normalize_cowrie_logs,
         normalize_ubuntu_auth_logs,
         normalized_events_to_raw_logs,
     )
@@ -32,6 +35,7 @@ RESET = "\033[0m"
 # -------- CONFIG --------
 IOC_FILE = Path("data/iocs.json")
 LOG_FILE = Path("logs/sample-auth.log")
+COWRIE_LOG_FILE = Path("logs/sample-cowrie.jsonl")
 ALERT_FILE = Path("alerts/alerts.csv")
 INCIDENT_FILE = Path("alerts/incidents.json")
 DEDUP_STATE_FILE = Path("alerts/dedup-state.json")
@@ -865,8 +869,18 @@ def main() -> None:
     log_lines = read_logs(
         LOG_FILE
     )
-    normalized_events = normalize_ubuntu_auth_logs(
+
+    ubuntu_events = normalize_ubuntu_auth_logs(
         log_lines
+    )
+
+    cowrie_events = normalize_cowrie_logs(
+        COWRIE_LOG_FILE
+    )
+
+    normalized_events = (
+        ubuntu_events
+        + cowrie_events
     )
 
     ip_events = group_events_by_source_ip(
@@ -880,8 +894,18 @@ def main() -> None:
     )
 
     print(
-        f"Log source: "
+        f"Ubuntu log source: "
         f"{LOG_FILE}"
+    )
+
+    print(
+        f"Cowrie log source: "
+        f"{COWRIE_LOG_FILE}"
+    )
+
+    print(
+        f"Normalized events: "
+        f"{len(normalized_events)}"
     )
 
     print(
@@ -930,7 +954,6 @@ def main() -> None:
             incident_windows,
             start=1,
         ):
-
             failed, successful = (
                 count_normalized_events(
                     incident_logs
@@ -942,6 +965,7 @@ def main() -> None:
                     incident_logs
                 )
             )
+
             if not should_alert(
                 failed,
                 successful,

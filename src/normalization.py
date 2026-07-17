@@ -4,6 +4,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+
 @dataclass
 class SecurityEvent:
     """Normalized security event shared across log sources."""
@@ -45,14 +46,14 @@ def parse_ubuntu_timestamp(
     )
 
     try:
-        parsed = datetime.datetime.strptime(
+        parsed_timestamp = datetime.datetime.strptime(
             timestamp_text,
             "%Y %b %d %H:%M:%S",
         )
     except ValueError:
         return None
 
-    return parsed.isoformat()
+    return parsed_timestamp.isoformat()
 
 
 def normalize_ubuntu_auth_log(
@@ -80,9 +81,13 @@ def normalize_ubuntu_auth_log(
     if failed_match:
         return SecurityEvent(
             timestamp=parse_ubuntu_timestamp(log),
-            source_ip=failed_match.group("source_ip"),
+            source_ip=failed_match.group(
+                "source_ip"
+            ),
             event_type="authentication_failure",
-            username=failed_match.group("username"),
+            username=failed_match.group(
+                "username"
+            ),
             source="ubuntu_auth",
             destination_port=int(
                 failed_match.group("port")
@@ -94,9 +99,13 @@ def normalize_ubuntu_auth_log(
     if accepted_match:
         return SecurityEvent(
             timestamp=parse_ubuntu_timestamp(log),
-            source_ip=accepted_match.group("source_ip"),
+            source_ip=accepted_match.group(
+                "source_ip"
+            ),
             event_type="authentication_success",
-            username=accepted_match.group("username"),
+            username=accepted_match.group(
+                "username"
+            ),
             source="ubuntu_auth",
             destination_port=int(
                 accepted_match.group("port")
@@ -115,12 +124,170 @@ def normalize_ubuntu_auth_logs(
     events: list[SecurityEvent] = []
 
     for log in logs:
-        event = normalize_ubuntu_auth_log(log)
+        event = normalize_ubuntu_auth_log(
+            log
+        )
 
         if event is not None:
             events.append(event)
 
     return events
+
+
+def normalize_cowrie_event(
+    event_data: dict,
+) -> SecurityEvent | None:
+    """Normalize one supported Cowrie JSON event."""
+    event_type_map = {
+        "cowrie.login.failed": (
+            "authentication_failure"
+        ),
+        "cowrie.login.success": (
+            "authentication_success"
+        ),
+        "cowrie.command.input": (
+            "command_executed"
+        ),
+        "cowrie.session.closed": (
+            "session_closed"
+        ),
+    }
+
+    cowrie_event_id = event_data.get(
+        "eventid"
+    )
+
+    normalized_event_type = (
+        event_type_map.get(
+            cowrie_event_id
+        )
+    )
+
+    if normalized_event_type is None:
+        return None
+
+    source_ip = event_data.get(
+        "src_ip"
+    )
+
+    if not source_ip:
+        return None
+
+    timestamp = event_data.get(
+        "timestamp"
+    )
+
+    if timestamp:
+        normalized_timestamp = str(
+            timestamp
+        ).replace(
+            "Z",
+            "+00:00",
+        )
+
+        try:
+            timestamp = (
+                datetime.datetime.fromisoformat(
+                    normalized_timestamp
+                ).isoformat()
+            )
+        except ValueError:
+            timestamp = None
+
+    destination_port = event_data.get(
+        "dst_port"
+    )
+
+    try:
+        destination_port = (
+            int(destination_port)
+            if destination_port is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        destination_port = None
+
+    raw_log = json.dumps(
+        event_data,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+    return SecurityEvent(
+        timestamp=timestamp,
+        source_ip=str(source_ip),
+        event_type=normalized_event_type,
+        username=event_data.get(
+            "username"
+        ),
+        source="cowrie",
+        destination_port=destination_port,
+        protocol="ssh",
+        raw_log=raw_log,
+    )
+
+
+def read_cowrie_jsonl(
+    log_file: Path,
+) -> list[dict]:
+    """Read Cowrie JSONL records, skipping malformed lines."""
+    events: list[dict] = []
+
+    try:
+        with log_file.open(
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as file:
+            for line in file:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    event_data = json.loads(
+                        line
+                    )
+                except json.JSONDecodeError:
+                    continue
+
+                if isinstance(
+                    event_data,
+                    dict,
+                ):
+                    events.append(
+                        event_data
+                    )
+
+    except FileNotFoundError:
+        return []
+
+    return events
+
+
+def normalize_cowrie_logs(
+    log_file: Path,
+) -> list[SecurityEvent]:
+    """Read and normalize supported Cowrie JSONL events."""
+    normalized_events: list[
+        SecurityEvent
+    ] = []
+
+    for event_data in read_cowrie_jsonl(
+        log_file
+    ):
+        event = normalize_cowrie_event(
+            event_data
+        )
+
+        if event is not None:
+            normalized_events.append(
+                event
+            )
+
+    return normalized_events
+
 
 def group_events_by_source_ip(
     events: list[SecurityEvent],
@@ -146,14 +313,21 @@ def create_normalized_event_windows(
 ) -> list[list[SecurityEvent]]:
     """Group normalized events into fixed time windows."""
     parsed_events: list[
-        tuple[datetime.datetime, SecurityEvent]
+        tuple[
+            datetime.datetime,
+            SecurityEvent,
+        ]
     ] = []
 
-    unparsed_events: list[SecurityEvent] = []
+    unparsed_events: list[
+        SecurityEvent
+    ] = []
 
     for event in events:
         if event.timestamp is None:
-            unparsed_events.append(event)
+            unparsed_events.append(
+                event
+            )
             continue
 
         try:
@@ -162,8 +336,27 @@ def create_normalized_event_windows(
                     event.timestamp
                 )
             )
+
+            # Cowrie timestamps include timezone data,
+            # while Ubuntu syslog timestamps do not.
+            # Convert aware values to naive UTC so all
+            # timestamps can be sorted and correlated.
+            if (
+                parsed_timestamp.tzinfo
+                is not None
+            ):
+                parsed_timestamp = (
+                    parsed_timestamp.astimezone(
+                        datetime.timezone.utc
+                    ).replace(
+                        tzinfo=None
+                    )
+                )
+
         except ValueError:
-            unparsed_events.append(event)
+            unparsed_events.append(
+                event
+            )
             continue
 
         parsed_events.append(
@@ -177,9 +370,17 @@ def create_normalized_event_windows(
         key=lambda item: item[0]
     )
 
-    windows: list[list[SecurityEvent]] = []
-    current_window: list[SecurityEvent] = []
-    window_start: datetime.datetime | None = None
+    windows: list[
+        list[SecurityEvent]
+    ] = []
+
+    current_window: list[
+        SecurityEvent
+    ] = []
+
+    window_start: (
+        datetime.datetime | None
+    ) = None
 
     for timestamp, event in parsed_events:
         if window_start is None:
@@ -194,17 +395,25 @@ def create_normalized_event_windows(
         if time_difference <= datetime.timedelta(
             minutes=window_minutes
         ):
-            current_window.append(event)
+            current_window.append(
+                event
+            )
         else:
-            windows.append(current_window)
+            windows.append(
+                current_window
+            )
             current_window = [event]
             window_start = timestamp
 
     if current_window:
-        windows.append(current_window)
+        windows.append(
+            current_window
+        )
 
     for event in unparsed_events:
-        windows.append([event])
+        windows.append(
+            [event]
+        )
 
     return windows
 
@@ -238,132 +447,3 @@ def normalized_events_to_raw_logs(
         event.raw_log
         for event in events
     ]
-
-def normalize_cowrie_event(
-    event_data: dict,
-) -> SecurityEvent | None:
-    """Normalize one Cowrie JSON event."""
-
-    event_type_map = {
-        "cowrie.login.failed": "authentication_failure",
-        "cowrie.login.success": "authentication_success",
-        "cowrie.command.input": "command_executed",
-        "cowrie.session.closed": "session_closed",
-    }
-
-    cowrie_event_id = event_data.get("eventid")
-    normalized_event_type = event_type_map.get(
-        cowrie_event_id
-    )
-
-    if normalized_event_type is None:
-        return None
-
-    source_ip = event_data.get("src_ip")
-
-    if not source_ip:
-        return None
-
-    timestamp = event_data.get("timestamp")
-
-    if timestamp:
-        timestamp = timestamp.replace(
-            "Z",
-            "+00:00",
-        )
-
-        try:
-            timestamp = (
-                datetime.datetime.fromisoformat(
-                    timestamp
-                ).isoformat()
-            )
-        except ValueError:
-            timestamp = None
-
-    destination_port = event_data.get(
-        "dst_port"
-    )
-
-    try:
-        destination_port = (
-            int(destination_port)
-            if destination_port is not None
-            else None
-        )
-    except (TypeError, ValueError):
-        destination_port = None
-
-    raw_log = json.dumps(
-        event_data,
-        sort_keys=True,
-        ensure_ascii=False,
-    )
-
-    return SecurityEvent(
-        timestamp=timestamp,
-        source_ip=str(source_ip),
-        event_type=normalized_event_type,
-        username=event_data.get("username"),
-        source="cowrie",
-        destination_port=destination_port,
-        protocol="ssh",
-        raw_log=raw_log,
-    )
-
-
-def read_cowrie_jsonl(
-    log_file: Path,
-) -> list[dict]:
-    """Read Cowrie JSONL records, skipping malformed lines."""
-    events: list[dict] = []
-
-    try:
-        with log_file.open(
-            "r",
-            encoding="utf-8",
-            errors="replace",
-        ) as file:
-            for line in file:
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                try:
-                    event_data = json.loads(
-                        line
-                    )
-                except json.JSONDecodeError:
-                    continue
-
-                if isinstance(event_data, dict):
-                    events.append(event_data)
-
-    except FileNotFoundError:
-        return []
-
-    return events
-
-
-def normalize_cowrie_logs(
-    log_file: Path,
-) -> list[SecurityEvent]:
-    """Read and normalize supported Cowrie JSONL events."""
-    normalized_events: list[
-        SecurityEvent
-    ] = []
-
-    for event_data in read_cowrie_jsonl(
-        log_file
-    ):
-        event = normalize_cowrie_event(
-            event_data
-        )
-
-        if event is not None:
-            normalized_events.append(
-                event
-            )
-
-    return normalized_events
