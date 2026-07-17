@@ -10,6 +10,9 @@ from src.normalization import (
     normalize_ubuntu_auth_log,
     normalize_ubuntu_auth_logs,
     parse_ubuntu_timestamp,
+    normalize_cowrie_event,
+    normalize_cowrie_logs,
+    read_cowrie_jsonl,
 )
 
 
@@ -404,6 +407,185 @@ class TestNormalizedEventProcessing(unittest.TestCase):
                 "original-log-one",
                 "original-log-two",
             ],
+        )
+
+class TestCowrieNormalization(unittest.TestCase):
+    def test_failed_login_is_normalized(self):
+        event_data = {
+            "eventid": "cowrie.login.failed",
+            "timestamp": "2026-07-17T10:00:00.000000Z",
+            "src_ip": "45.141.215.90",
+            "dst_port": 22,
+            "username": "root",
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.event_type,
+            "authentication_failure",
+        )
+        self.assertEqual(
+            event.source_ip,
+            "45.141.215.90",
+        )
+        self.assertEqual(
+            event.username,
+            "root",
+        )
+        self.assertEqual(
+            event.source,
+            "cowrie",
+        )
+        self.assertEqual(
+            event.destination_port,
+            22,
+        )
+
+    def test_successful_login_is_normalized(self):
+        event_data = {
+            "eventid": "cowrie.login.success",
+            "timestamp": "2026-07-17T10:02:00.000000Z",
+            "src_ip": "45.141.215.90",
+            "dst_port": 22,
+            "username": "root",
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.event_type,
+            "authentication_success",
+        )
+
+    def test_command_event_is_normalized(self):
+        event_data = {
+            "eventid": "cowrie.command.input",
+            "timestamp": "2026-07-17T10:03:00.000000Z",
+            "src_ip": "45.141.215.90",
+            "dst_port": 22,
+            "input": "uname -a",
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.event_type,
+            "command_executed",
+        )
+        self.assertIsNone(
+            event.username
+        )
+
+    def test_session_closed_is_normalized(self):
+        event_data = {
+            "eventid": "cowrie.session.closed",
+            "timestamp": "2026-07-17T10:05:00.000000Z",
+            "src_ip": "45.141.215.90",
+            "dst_port": 22,
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.event_type,
+            "session_closed",
+        )
+
+    def test_unsupported_event_returns_none(self):
+        event_data = {
+            "eventid": "cowrie.client.version",
+            "timestamp": "2026-07-17T10:06:00.000000Z",
+            "src_ip": "45.141.215.90",
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNone(event)
+
+    def test_missing_source_ip_returns_none(self):
+        event_data = {
+            "eventid": "cowrie.login.failed",
+            "timestamp": "2026-07-17T10:00:00.000000Z",
+            "username": "root",
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNone(event)
+
+    def test_invalid_timestamp_preserves_event(self):
+        event_data = {
+            "eventid": "cowrie.login.failed",
+            "timestamp": "not-a-valid-time",
+            "src_ip": "45.141.215.90",
+            "dst_port": 22,
+            "username": "root",
+        }
+
+        event = normalize_cowrie_event(event_data)
+
+        self.assertIsNotNone(event)
+        self.assertIsNone(
+            event.timestamp
+        )
+
+    def test_jsonl_reader_skips_malformed_lines(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_file = Path(directory) / "cowrie.jsonl"
+
+            log_file.write_text(
+                "\n".join(
+                    [
+                        (
+                            '{"eventid":"cowrie.login.failed",'
+                            '"src_ip":"45.141.215.90"}'
+                        ),
+                        "not-valid-json",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            events = read_cowrie_jsonl(
+                log_file
+            )
+
+        self.assertEqual(
+            len(events),
+            1,
+        )
+
+    def test_sample_file_normalizes_five_events(self):
+        from pathlib import Path
+
+        events = normalize_cowrie_logs(
+            Path("logs/sample-cowrie.jsonl")
+        )
+
+        self.assertEqual(
+            len(events),
+            5,
+        )
+        self.assertEqual(
+            events[0].event_type,
+            "authentication_failure",
+        )
+        self.assertEqual(
+            events[2].event_type,
+            "authentication_success",
+        )
+        self.assertEqual(
+            events[3].event_type,
+            "command_executed",
         )
 
 if __name__ == "__main__":

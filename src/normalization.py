@@ -1,7 +1,8 @@
 import datetime
+import json
 import re
 from dataclasses import asdict, dataclass
-
+from pathlib import Path
 
 @dataclass
 class SecurityEvent:
@@ -237,3 +238,132 @@ def normalized_events_to_raw_logs(
         event.raw_log
         for event in events
     ]
+
+def normalize_cowrie_event(
+    event_data: dict,
+) -> SecurityEvent | None:
+    """Normalize one Cowrie JSON event."""
+
+    event_type_map = {
+        "cowrie.login.failed": "authentication_failure",
+        "cowrie.login.success": "authentication_success",
+        "cowrie.command.input": "command_executed",
+        "cowrie.session.closed": "session_closed",
+    }
+
+    cowrie_event_id = event_data.get("eventid")
+    normalized_event_type = event_type_map.get(
+        cowrie_event_id
+    )
+
+    if normalized_event_type is None:
+        return None
+
+    source_ip = event_data.get("src_ip")
+
+    if not source_ip:
+        return None
+
+    timestamp = event_data.get("timestamp")
+
+    if timestamp:
+        timestamp = timestamp.replace(
+            "Z",
+            "+00:00",
+        )
+
+        try:
+            timestamp = (
+                datetime.datetime.fromisoformat(
+                    timestamp
+                ).isoformat()
+            )
+        except ValueError:
+            timestamp = None
+
+    destination_port = event_data.get(
+        "dst_port"
+    )
+
+    try:
+        destination_port = (
+            int(destination_port)
+            if destination_port is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        destination_port = None
+
+    raw_log = json.dumps(
+        event_data,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+    return SecurityEvent(
+        timestamp=timestamp,
+        source_ip=str(source_ip),
+        event_type=normalized_event_type,
+        username=event_data.get("username"),
+        source="cowrie",
+        destination_port=destination_port,
+        protocol="ssh",
+        raw_log=raw_log,
+    )
+
+
+def read_cowrie_jsonl(
+    log_file: Path,
+) -> list[dict]:
+    """Read Cowrie JSONL records, skipping malformed lines."""
+    events: list[dict] = []
+
+    try:
+        with log_file.open(
+            "r",
+            encoding="utf-8",
+            errors="replace",
+        ) as file:
+            for line in file:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    event_data = json.loads(
+                        line
+                    )
+                except json.JSONDecodeError:
+                    continue
+
+                if isinstance(event_data, dict):
+                    events.append(event_data)
+
+    except FileNotFoundError:
+        return []
+
+    return events
+
+
+def normalize_cowrie_logs(
+    log_file: Path,
+) -> list[SecurityEvent]:
+    """Read and normalize supported Cowrie JSONL events."""
+    normalized_events: list[
+        SecurityEvent
+    ] = []
+
+    for event_data in read_cowrie_jsonl(
+        log_file
+    ):
+        event = normalize_cowrie_event(
+            event_data
+        )
+
+        if event is not None:
+            normalized_events.append(
+                event
+            )
+
+    return normalized_events
